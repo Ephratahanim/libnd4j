@@ -5,9 +5,9 @@ libnd4j depends on some Unix utilities for compilation. So in order to compile i
 
 After you have setup Msys2 by following [their instructions](https://msys2.github.io/), you will have to install some additional development packages. Start the msys2 shell and setup the dev environment with:
 
-    pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-extra-cmake-modules make pkg-config grep sed gzip tar mingw64/mingw-w64-x86_64-openblas
+    pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-extra-cmake-modules make pkg-config grep sed gzip tar mingw64/mingw-w64-x86_64-openblas mingw-w64-x86_64-lz4
 
-This will install the needed dependencies for use in the msys2 shell.
+This will install the needed dependencies for use in the msys2 shell. You will have to use the msys2 shell (especially `c:\msys64\mingw64.exe`) for the whole compilation process.
 
 You will also need to setup your PATH environment variable to include `C:\msys64\mingw64\bin` (or where ever you have decided to install msys2). If you have IntelliJ (or another IDE) open, you will have to restart it before this change takes effect for applications started through them. If you don't, you probably will see a "Can't find dependent libraries" error.
 
@@ -34,9 +34,10 @@ The CUDA Backend has some additional requirements before it can be built:
 
 In order to build the CUDA backend you will have to setup some more environment variables first, by calling `vcvars64.bat`.
 But first, set the system environment variable `SET_FULL_PATH` to `true`, so all of the variables that `vcvars64.bat` sets up, are passed to the mingw shell.
+Additionally, you need to open the `mingw64.ini` in your msys64 installation folder and add the command: `MSYS2_PATH_TYPE=inherit`.
 
 1. Inside a normal cmd.exe command prompt, run `C:\Program Files (x86)\Microsoft Visual Studio 12.0\VC\bin\amd64\vcvars64.bat`
-2. Run `c:\msys64\mingw64_shell.bat` inside that
+2. Run `c:\msys64\mingw64.exe` inside that
 3. Change to your libnd4j folder
 4. `./buildnativeoperations.sh -c cuda`
 
@@ -59,7 +60,7 @@ Now leave the libnd4j directory and clone the [nd4j repository](https://github.c
 
 If you don't want the cuda backend, e.g. because you didn't or can't build it, you can skip it:
 
-    mvn clean install -DskipTests -Dmaven.javadoc.skip=true -pl '!org.nd4j:nd4j-cuda-7.5,!org.nd4j:nd4j-tests'
+    mvn clean install -DskipTests -Dmaven.javadoc.skip=true -pl '!org.nd4j:nd4j-cuda-7.5,!org.nd4j:nd4j-cuda-7.5-platform,!org.nd4j:nd4j-tests'
 
 Please notice the single quotes around the last parameter, if you leave them out or use double quotes you will get an error about `event not found` from your shell. If this doesn't work, make sure you have a current version of maven installed.
 

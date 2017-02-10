@@ -11,9 +11,30 @@ Native operations for nd4j. Build using cmake
 
 ## OS Specific Requirements
 
+### Android
+
+[Download the NDK](https://developer.android.com/ndk/downloads/), extract it somewhere, and execute the following commands, replacing `android-xxx` with either `android-arm` or `android-x86`:
+
+```bash
+git clone https://github.com/bytedeco/javacpp-presets
+git clone https://github.com/deeplearning4j/libnd4j
+git clone https://github.com/deeplearning4j/nd4j
+export ANDROID_NDK=/path/to/android-ndk/
+export LIBND4J_HOME=$PWD/libnd4j/
+export OpenBLAS_HOME=$PWD/javacpp-presets/openblas/cppbuild/android-xxx/
+cd javacpp-presets/openblas
+bash cppbuild.sh install -platform android-xxx
+cd ../../libnd4j
+bash buildnativeoperations.sh -platform android-xxx
+cd ../nd4j
+mvn clean install -Djavacpp.platform=android-xxx -DskipTests -pl '!nd4j-backends/nd4j-backend-impls/nd4j-cuda,!nd4j-backends/nd4j-backend-impls/nd4j-cuda-platform'
+```
+
 ### OSX
 
-Run ./setuposx.sh (ensure you have brew installed)
+Run ./setuposx.sh (Please ensure you have brew installed)
+
+See [macOSx10 (CPU only).md](macOSx10 (CPU only).md)
 
 ### Linux
 
@@ -39,18 +60,32 @@ sudo rm /usr/bin/gcc
 sudo rm /usr/bin/g++
 sudo ln -s /usr/bin/gcc-4.9 /usr/bin/gcc
 sudo ln -s /usr/bin/g++-4.9 /usr/bin/g++
-./buildnativeoperations.sh blas cpu Debug
-./buildnativeoperations.sh blas cuda Debug
+./buildnativeoperations.sh
+./buildnativeoperations.sh -c cuda
 ```
 #### Ubuntu Linux 16.04
 
 ```bash
 sudo apt install libopenblas-dev
 sudo apt install cmake
-Installation of CUDA currently not supported by NVIDIA, working on a fix... 
+sudo apt install nvidia-cuda-dev nvidia-cuda-toolkit nvidia-361
+export TRICK_NVCC=YES
+./buildnativeoperations.sh
+./buildnativeoperations.sh -c cuda
+
 ```
 
 The standard development headers are needed.
+
+#### CentOS 6
+
+```bash
+yum install centos-release-scl-rh epel-release
+yum install devtoolset-3-toolchain maven30 cmake3 git openblas-devel
+scl enable devtoolset-3 maven30 bash
+./buildnativeoperations.sh
+./buildnativeoperations.sh -c cuda
+```
 
 ### Windows
 
@@ -85,10 +120,10 @@ See [Windows.md](windows.md)
 
 ## Linking with MKL
 
-We can link with MKL either at build time, or at runtime with binaries initially linked with another BLAS implementation such as OpenBLAS. In either case, simply add the path containing `libmkl_rt.so` (or `mkl_rt.dll` on Windows), say `/path/to/intel64/lib/`, to the `LD_LIBRARY_PATH` environment variable on Linux (or `PATH` on Windows), and build or run your Java application as usual. On Linux though, to make sure it uses the correct version of OpenMP, we also might need to set these environment variables:
+We can link with MKL either at build time, or at runtime with binaries initially linked with another BLAS implementation such as OpenBLAS. In either case, simply add the path containing `libmkl_rt.so` (or `mkl_rt.dll` on Windows), say `/path/to/intel64/lib/`, to the `LD_LIBRARY_PATH` environment variable on Linux (or `PATH` on Windows), and build or run your Java application as usual. If you get an error message like `undefined symbol: omp_get_num_procs`, it probably means that `libiomp5.so`, `libiomp5.dylib`, or `libiomp5md.dll` is not present on your system. In that case though, it is still possible to use the GNU version of OpenMP by setting these environment variables on Linux, for example:
 
 ```bash
 export MKL_THREADING_LAYER=GNU
-export LD_PRELOAD=/lib64/libgomp.so.1
+export LD_PRELOAD=/usr/lib64/libgomp.so.1
 ```
 

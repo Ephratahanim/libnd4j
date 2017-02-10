@@ -11,7 +11,9 @@
 #include <vector>
 #include <templatemath.h>
 #include <ops.h>
+#ifndef __CUDACC__
 #include <omp.h>
+#endif
 #include <pairwise_util.h>
 #include <dll.h>
 #include "reduce.h"
@@ -22,17 +24,14 @@
 #include <ops.h>
 #include <special_ops.h>
 #include <op_boilerplate.h>
+#include "types/float8.h"
 
-#ifdef __CUDACC__
-#include <helper_cuda.h>
-#endif
-
-#ifdef __JNI__
-#include <jni.h>
-#endif
 #ifdef __CUDACC__
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <helper_cuda.h>
+#define omp_get_thread_num() 0
+#define omp_get_max_threads() 1
 #endif
 
 
@@ -79,7 +78,15 @@
         (39,simdOps::SoftMaxDerivative), \
         (40,simdOps::LogSoftMax), \
         (41,simdOps::IsMax), \
-        (42,simdOps::SpecialDerivative)
+        (42,simdOps::SpecialDerivative), \
+        (43,simdOps::DropOut), \
+        (44,simdOps::DropOutInverted), \
+        (45,simdOps::CompareAndSet), \
+        (46,simdOps::ReplaceNans) ,\
+        (47,simdOps::StabilizeFP16) ,\
+        (48,simdOps::Histogram), \
+        (49,simdOps::Cube), \
+        (50,simdOps::CubeDerivative)
 
 
 namespace functions {
@@ -107,8 +114,7 @@ namespace functions {
 			int *indexes) {
 		Nd4jIndex n = shape::length(shapeInfo);
 		int totalThreads = gridDim.x * blockDim.x;
-		int tid = threadIdx.x;
-		Nd4jIndex i = blockIdx.x * blockDim.x + tid;
+		Nd4jIndex i = blockIdx.x * blockDim.x + threadIdx.x;
 
 		/* equal, positive, non-unit increments. */
 #pragma unroll
@@ -175,7 +181,7 @@ static __inline__ __device__ void transformCuda(
 			int xCoord[MAX_RANK];
 
 #pragma unroll
-			for (int i = tid; i < length; i+= gridDim.x * blockDim.x) {
+			for (Nd4jIndex i = tid; i < length; i+= gridDim.x * blockDim.x) {
 				//int *xIdx = shape::ind2sub(xRank, xShape, i, xIdx);
 				shape::ind2sub(xRank,shape::shapeOf(shapeInfo),i, xCoord);
 				Nd4jIndex xOffset2 = shape::getOffset(xOffset, xShape, xStride, xCoord, xRank);
@@ -266,9 +272,9 @@ template<typename OpType>
 				T *result,
 				int *resultShapeInfo,
 				T *extraParams,
-				Nd4jIndex *indexes,
-				Nd4jIndex *resultIndexes) {
-                            DISPATCH_BY_OPNUM(exec, PARAMS(dx, xShapeInfo, result, resultShapeInfo, extraParams, indexes, resultIndexes), TRANSFORM_OPS);
+				int *indexes,
+				int *resultIndexes, int *tadShapeInfo, int *tadOffsets) {
+                            DISPATCH_BY_OPNUM(exec, PARAMS(dx, xShapeInfo, result, resultShapeInfo, extraParams, indexes, resultIndexes, tadShapeInfo, tadOffsets), TRANSFORM_OPS);
 			}
 
 
@@ -278,8 +284,8 @@ template<typename OpType>
 				int *xShapeInfo,
 				T *result,
 				int *resultShapeInfo,
-				T *extraParams) {
-                                DISPATCH_BY_OPNUM(exec, PARAMS(dx, xShapeInfo, result, resultShapeInfo, extraParams), TRANSFORM_OPS);
+				T *extraParams, int *tadShapeInfo, int *tadOffsets) {
+                                DISPATCH_BY_OPNUM(exec, PARAMS(dx, xShapeInfo, result, resultShapeInfo, extraParams, tadShapeInfo, tadOffsets), TRANSFORM_OPS);
 			}
 
 
@@ -289,10 +295,10 @@ template<typename OpType>
                     int *xShapeInfo,
                     T *result,
                     int *resultShapeInfo,
-                    T *extraParams) {
+                    T *extraParams, int *tadShapeInfo, int *tadOffsets) {
 
                 if(OpType::requiresSpecial) {
-                    OpType::execSpecial(dx,xShapeInfo,result,resultShapeInfo,extraParams);
+                    OpType::execSpecial(dx,xShapeInfo,result,resultShapeInfo,extraParams, tadShapeInfo, tadOffsets);
                     return;
                 }
 
@@ -354,40 +360,56 @@ template<typename OpType>
 				T *result,
 				int *resultShapeInfo,
 				T *extraParams,
-				Nd4jIndex *indexes,
-				Nd4jIndex *resultIndexes) {
+				int *indexes,
+				int *resultIndexes, int *tadShapeInfo, int *tadOffsets) {
 
 				int n = shape::length(xShapeInfo);
-#pragma omp parallel for simd schedule(guided)
-				for (int i = 0; i < n; i++) {
+#pragma omp parallel for simd schedule(guided) proc_bind(AFFINITY) default(shared)
+				for (Nd4jIndex i = 0; i < n; i++) {
 					result[resultIndexes[i]] = OpType::op(dx[indexes[i]], extraParams);
 				}
 			}
 
-			template<typename OpType>
-			static void exec(T *dx,
-                              int xStride,
-                              T *result,
-                              int resultStride,
-                              T *extraParams,
-                              const int n) {
+            template<typename OpType>
+            static void exec(T *dx,
+                             int xStride,
+                             T *result,
+                             int resultStride,
+                             T *extraParams,
+                             const int n) {
+
+                int elementsPerThread = n / ELEMENT_THRESHOLD;
+                int num_threads = nd4j::math::nd4j_max<int>(1, elementsPerThread);
+                num_threads = nd4j::math::nd4j_min<int>(num_threads, omp_get_max_threads());
+
+                int span = (n / num_threads) + 8;
+
                 if (xStride == 1 && resultStride == 1) {
-					if (n > 2048) {
-#pragma omp parallel for simd schedule(guided)
-						for (int i = 0; i < n; i++) {
-							result[i] = OpType::op(dx[i], extraParams);
-						}
-					} else {
+
+#pragma omp parallel num_threads(num_threads) if (num_threads>1) proc_bind(AFFINITY) default(shared)
+                    {
+                        int tid = omp_get_thread_num();
+                        int start = span * tid;
+                        int end = span * (tid + 1);
+                        if (end > n) end = n;
 #pragma omp simd
-						for (int i = 0; i < n; i++) {
-							result[i] = OpType::op(dx[i], extraParams);
-						}
-					}
-                } else {
-#pragma omp parallel for simd schedule(guided) if (n > 2048)
-                        for (int i = 0; i < n; i++) {
-                            result[i * resultStride] = OpType::op(dx[i * xStride], extraParams);
+                        for (Nd4jIndex i = start; i < end; i++) {
+                            result[i] = OpType::op(dx[i], extraParams);
                         }
+                    }
+                } else {
+
+#pragma omp parallel num_threads(num_threads) if (num_threads>1) proc_bind(AFFINITY) default(shared)
+                    {
+                        int tid = omp_get_thread_num();
+                        int start = span * tid;
+                        int end = span * (tid + 1);
+                        if (end > n) end = n;
+#pragma omp simd
+                        for (Nd4jIndex i = start; i < end; i++) {
+                            result[i*resultStride] = OpType::op(dx[i * resultStride], extraParams);
+                        }
+                    }
                 }
             }
         };
@@ -398,16 +420,6 @@ template<typename OpType>
 
 
 #ifdef __CUDACC__
-/*
- * 	T *dy,
-			int *shapeInfo,
-			T *params,
-			T *result,
-			int *indexes
- */
-
-
-
 /**
  * The c and driver interface
  *  for th kernels
@@ -453,35 +465,34 @@ __device__ void transformGeneric(
 		manager);
 }
 
-/**
- * The c and driver interface
- *  for th kernels
- * @param opNum the op number
- * @param n the length of the problem
- * @param idx
- * the start index
- * @param dy the vector to transform
- * @param incy the stride for the vector
- * @param params the extra parameters for the problem
- * @param result the result storage
- * @param blockernelHeight the block size for the problem
- */
-__global__ void transformDouble(
-		int opNum,
+template <typename T, typename OpClass>
+__device__ void transformSimpleGeneric(
 		Nd4jIndex n,
-		double *dy,
+		T *dy,
 		int incy,
-		double *params,
-		double *result,int resultStride, int *allocationPointer, double *reductionPointer) {
+		T *params,
+		T *result,
+		int resultStride, int *allocationPointer, T *reductionPointer) {
 
-	transformGeneric<double>(
-			opNum,
-			n,
-			dy,
-			incy,
-			params,
-			result,
-			resultStride, allocationPointer, reductionPointer);
+	__shared__ UnifiedSharedMemory *manager;
+
+	if(threadIdx.x == 0) {
+	    extern __shared__ unsigned char shmem[];
+        manager = new(shmem) UnifiedSharedMemory((int *) shmem);
+	    manager->init(sizeof(UnifiedSharedMemory), 0, sizeof(functions::transform::Transform<T>), sizeof(shape::TAD), 0);
+	}
+	__syncthreads();
+
+	functions::transform::Transform<T>::template transformCuda<OpClass>(
+		n,
+		dy,
+		incy,
+		params,
+		result,
+		resultStride,
+		allocationPointer,
+		reductionPointer,
+		manager);
 }
 
 /**
@@ -497,37 +508,7 @@ __global__ void transformDouble(
  * @param result the result storage
  * @param blockernelHeight the block size for the problem
  */
-__global__ void transformFloat(
-		int opNum,
-		Nd4jIndex n,
-		float *dy,
-		int incy,
-		float *params,
-		float *result,int resultStride, int *allocationPointer, float *reductionPointer) {
-
-	transformGeneric<float>(
-			opNum,
-			n,
-			dy,
-			incy,
-			params,
-			result,resultStride, allocationPointer, reductionPointer);
-
-}
-
-/**
- * The c and driver interface
- *  for th kernels
- * @param opNum the op number
- * @param n the length of the problem
- * @param idx
- * the start index
- * @param dy the vector to transform
- * @param incy the stride for the vector
- * @param params the extra parameters for the problem
- * @param result the result storage
- * @param blockernelHeight the block size for the problem
- */
+/*
 template <typename T>
 __device__ void transformGeneric(
 		int opNum,
@@ -557,65 +538,35 @@ __device__ void transformGeneric(
 	    reductionPointer,
 	    manager);
 }
+*/
 
 
+template <typename T, typename OpClass>
+__device__ void transformSimpleGeneric(
+		T *dy,
+		int *xShapeInfo, int xRank,
+		T *params,
+		T *result,int *resultShapeInfo, int zRank, int *allocationPointer, T *reductionPointer) {
 
-/**
- * The c and driver interface
- *  for th kernels
- * @param opNum the op number
- * @param n the length of the problem
- * @param idx
- * the start index
- * @param dy the vector to transform
- * @param incy the stride for the vector
- * @param params the extra parameters for the problem
- * @param result the result storage
- * @param blockernelHeight the block size for the problem
- */
-extern "C" __global__ void transformDouble(
-		int opNum,
-		double *dy,
-		int *shapeInfo, int xRank,
-		double *params,
-		double *result,int *resultShapeInfo, int zRank, int *allocationPointer, double *reductionPointer) {
+	__shared__ UnifiedSharedMemory *manager;
 
-	transformGeneric<double>(
-			opNum,
-			dy,
-			shapeInfo, xRank,
-			params,
-			result,resultShapeInfo, zRank, allocationPointer, reductionPointer);
-}
+    if (threadIdx.x == 0) {
+        extern __shared__ unsigned char shmem[];
+        manager = new(shmem) UnifiedSharedMemory((int *) shmem);
+	    manager->init(sizeof(UnifiedSharedMemory), 0, sizeof(functions::transform::Transform<T>), sizeof(shape::TAD), xRank);
+	}
+	__syncthreads();
 
-/**
- * The c and driver interface
- *  for th kernels
- * @param opNum the op number
- * @param n the length of the problem
- * @param idx
- * the start index
- * @param dy the vector to transform
- * @param incy the stride for the vector
- * @param params the extra parameters for the problem
- * @param result the result storage
- * @param blockernelHeight the block size for the problem
- */
-extern "C" __global__ void transformFloat(
-		int opNum,
-		float *dy,
-		int *shapeInfo, int xRank,
-		float *params,
-		float *result,int *resultShapeInfo, int zRank, int *allocationPointer, float *reductionPointer) {
 
-	transformGeneric<float>(
-			opNum,
-			dy,
-			shapeInfo, xRank,
-			params,
-			result,
-			resultShapeInfo, zRank, allocationPointer, reductionPointer);
-
+	functions::transform::Transform<T>::template transformCuda<OpClass>(
+	    dy,
+	    xShapeInfo,
+	    params,
+	    result,
+	    resultShapeInfo,
+	    allocationPointer,
+	    reductionPointer,
+	    manager);
 }
 
 
@@ -722,6 +673,24 @@ extern "C" __global__ void transformFloatIndexes(
 
 }
 
+extern "C" __global__ void transformHalfIndexes(
+		int opNum,
+		float16 *dy,
+		int *shapeInfo, int xRank,
+		float16 *params,
+		float16 *result,int *indexes, int *allocationPointer, float16 *reductionPointer) {
+
+	transformGenericIndexes<float16>(
+			opNum,
+			dy,
+			shapeInfo, xRank,
+			params,
+			result,indexes, allocationPointer, reductionPointer);
+
+}
+
+
+
 /**
 * This is utility kernel, that updates given special buffer with proper values in device memory
 */
@@ -774,6 +743,9 @@ extern "C" __global__ void fillIsMaxDouble(double *dx, long length, long idx) {
     fillIsMaxGeneric<double>(dx, length, idx);
 }
 
+extern "C" __global__ void fillIsMaxHalf(float16 *dx, long length, long idx) {
+    fillIsMaxGeneric<float16>(dx, length, idx);
+}
 
 template <typename T>
 __device__ void fillDimensionalIsMaxGeneric(T *dX, int *xShapeInfo, T *dZ, int *zShapeInfo, int *tadOnlyShapeInfo, int *dimension, int dimensionLength, int *tadOffsets) {
@@ -812,15 +784,17 @@ __device__ void fillDimensionalIsMaxGeneric(T *dX, int *xShapeInfo, T *dZ, int *
         int tadOffsetForBlock = tadOffsets[r];
 
         int highestElement = (int) dX[r];
-/*
-        if (threadIdx.x == 0)
-            printf("TAD: [%i], highestElement: [%i], numTads: [%i], tadLength: [%i]\n", r, highestElement, numTads, tadLength);
-*/
+
+//        if (threadIdx.x == 0)
+//            printf("TAD: [%i], highestElement: [%i], numTads: [%i], tadLength: [%i], tadOffset: [%i], tadEWS: [%i]\n", r, highestElement, numTads, tadLength, tadOffsetForBlock, tadEWS);
+
 
         for (int e = threadIdx.x; e < tadLength; e += blockDim.x) {
             // so, we just set dZ[e] for each TAD. Sure, e should be replaced with
-            dZ[tadOffsetForBlock + e * tadEWS] = (e == highestElement? 1.0 : 0.0);
+            int idx = tadOffsetForBlock + (e * tadEWS);
+            dZ[idx] = (e == highestElement? (T) 1.0 : (T) 0.0);
         }
+
     }
 }
 
@@ -830,6 +804,10 @@ extern "C" __global__ void fillDimensionalIsMaxFloat(float *dx, int *xShapeInfo,
 
 extern "C" __global__ void fillDimensionalIsMaxDouble(double *dx, int *xShapeInfo, double *dz, int *zShapeInfo, int *tadOnlyShapeInfo, int *dimension, int dimensionLength, int *tadOffsets) {
     fillDimensionalIsMaxGeneric<double>(dx, xShapeInfo, dz, zShapeInfo, tadOnlyShapeInfo, dimension, dimensionLength, tadOffsets);
+}
+
+extern "C" __global__ void fillDimensionalIsMaxHalf(float16 *dx, int *xShapeInfo, float16 *dz, int *zShapeInfo, int *tadOnlyShapeInfo, int *dimension, int dimensionLength, int *tadOffsets) {
+    fillDimensionalIsMaxGeneric<float16>(dx, xShapeInfo, dz, zShapeInfo, tadOnlyShapeInfo, dimension, dimensionLength, tadOffsets);
 }
 
 template <typename T>
@@ -867,7 +845,7 @@ __device__ void concatKernelGeneric(int dimension,
 		__shared__ int yEWS;
 		if (threadIdx.x == 0) {
 			tDim[0] = dimension;
-			tad = new(manager->getTADSpace()) shape::TAD(); //(xShapeInfo,dimension,dimensionLength)
+			tad = new shape::TAD(); //(xShapeInfo,dimension,dimensionLength) // (manager->getTADSpace())
 			tad->setExternalBuffers((void *) manager);
 			//    tad->initWithExternalTAD(manager->getT1ShapeBuffer(), manager->getXShapeBuffer(), dimension, dimensionLength);
 			tad->init(resultShapeInfo, tDim, 1);
@@ -1021,7 +999,7 @@ __device__ void concatKernelGeneric(int dimension,
 //				delete inputTAD;
 		}
 
-		if (threadIdx.x == 0)
+		if (threadIdx.x == 0 && tad != NULL)
 			delete tad;
 }
 
@@ -1049,6 +1027,16 @@ extern "C" __global__ void concatKernelScalarFloat(int dimension,
 											  int *resultShapeInfo, Nd4jPointer *tadPointers, Nd4jPointer *offsetPointers) {
 
     concatKernelScalarGeneric<float>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
+}
+
+extern "C" __global__ void concatKernelScalarHalf(int dimension,
+											  int numArrays,
+											  Nd4jPointer *data,
+											  Nd4jPointer *inputShapeInfo,
+											  float16 *result,
+											  int *resultShapeInfo, Nd4jPointer *tadPointers, Nd4jPointer *offsetPointers) {
+
+    concatKernelScalarGeneric<float16>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
 }
 
 extern "C" __global__ void concatKernelScalarDouble(int dimension,
@@ -1131,6 +1119,16 @@ extern "C" __global__ void concatKernelHStackDouble(int dimension,
 }
 
 
+extern "C" __global__ void concatKernelHStackHalf(int dimension,
+											  int numArrays,
+											  Nd4jPointer *data,
+											  Nd4jPointer *inputShapeInfo,
+											  float16 *result,
+											  int *resultShapeInfo, Nd4jPointer *tadPointers, Nd4jPointer *offsetPointers) {
+
+    concatKernelHStackGeneric<float16>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
+}
+
 template <typename T>
 __device__ void concatKernelVStackGeneric(int dimension,
 									int numArrays,
@@ -1194,6 +1192,16 @@ extern "C" __global__ void concatKernelVStackDouble(int dimension,
     concatKernelVStackGeneric<double>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
 }
 
+extern "C" __global__ void concatKernelVStackHalf(int dimension,
+											  int numArrays,
+											  Nd4jPointer *data,
+											  Nd4jPointer *inputShapeInfo,
+											  float16 *result,
+											  int *resultShapeInfo, Nd4jPointer *tadPointers, Nd4jPointer *offsetPointers) {
+
+    concatKernelVStackGeneric<float16>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
+}
+
 
 extern "C" __global__ void concatKernelDouble(int dimension,
 											  int numArrays,
@@ -1213,6 +1221,281 @@ extern "C" __global__ void concatKernelFloat(int dimension,
 	concatKernelGeneric<float>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
 }
 
+extern "C" __global__ void concatKernelHalf(int dimension,
+											 int numArrays,
+											 Nd4jPointer *data,
+											 Nd4jPointer *inputShapeInfo,
+											 float16 *result,
+											 int *resultShapeInfo, Nd4jPointer *tadPointers, Nd4jPointer *offsetPointers) {
+	concatKernelGeneric<float16>(dimension, numArrays, data, inputShapeInfo, result, resultShapeInfo, tadPointers, offsetPointers);
+}
+
+
+template <typename T>
+__device__ void pullRowsKernelGeneric(T *x,
+                                     int *xShapeInfo,
+                                     T *z,
+                                     int *zShapeInfo,
+                                     int n,
+                                     int *indexes,
+                                     int *tadShapeInfo,
+                                     int *tadOffsets,
+                                     int *zTadShapeInfo,
+                                     int *zTadOffsets) {
+
+
+    int xEWS = shape::elementWiseStride(tadShapeInfo);
+    int zEWS = shape::elementWiseStride(zTadShapeInfo);
+    int tadLength = shape::length(tadShapeInfo);
+
+    for (int idx = blockIdx.x; idx < n; idx += gridDim.x) {
+        int tadOffsetForBlock = tadOffsets[indexes[idx]];
+
+        T *rX = x + tadOffsetForBlock;
+        T *rZ = z + zTadOffsets[idx];
+
+        for (int i = threadIdx.x; i < tadLength; i += blockDim.x) {
+            rZ[i * zEWS] = rX[i * xEWS];
+        }
+    }
+}
+
+extern "C" __global__ void pullRowsKernelHalf(
+                                     float16 *x,
+                                     int *xShapeInfo,
+                                     float16 *z,
+                                     int *zShapeInfo,
+                                     int n,
+                                     int *indexes,
+                                     int *tadShapeInfo,
+                                     int *tadOffsets,
+                                     int *zTadShapeInfo,
+                                     int *zTadOffsets) {
+    pullRowsKernelGeneric<float16>(x, xShapeInfo, z, zShapeInfo, n, indexes, tadShapeInfo, tadOffsets, zTadShapeInfo, zTadOffsets);
+}
+
+extern "C" __global__ void pullRowsKernelFloat(float *x,
+                                     int *xShapeInfo,
+                                     float *z,
+                                     int *zShapeInfo,
+                                     int n,
+                                     int *indexes,
+                                     int *tadShapeInfo,
+                                     int *tadOffsets,
+                                     int *zTadShapeInfo,
+                                     int *zTadOffsets) {
+    pullRowsKernelGeneric<float>(x, xShapeInfo, z, zShapeInfo, n, indexes, tadShapeInfo, tadOffsets, zTadShapeInfo, zTadOffsets);
+}
+
+extern "C" __global__ void pullRowsKernelDouble(double *x,
+                                     int *xShapeInfo,
+                                     double *z,
+                                     int *zShapeInfo,
+                                     int n,
+                                     int *indexes,
+                                     int *tadShapeInfo,
+                                     int *tadOffsets,
+                                     int *zTadShapeInfo,
+                                     int *zTadOffsets) {
+    pullRowsKernelGeneric<double>(x, xShapeInfo, z, zShapeInfo, n, indexes, tadShapeInfo, tadOffsets, zTadShapeInfo, zTadOffsets);
+}
+
+template <typename T>
+__device__ void convertToHalfGeneric(T *dx, int n, half *dz) {
+    int tid = threadIdx.x + blockIdx.x * gridDim.x;
+
+    for (Nd4jIndex i = tid; i < n; i += blockDim.x * gridDim.x ) {
+        dz[i] = __float2half((float) dx[i]);
+    }
+}
+
+extern "C" __global__ void kernelFloatsToHalfs(float *dx, int n, half *dz) {
+    convertToHalfGeneric<float>(dx, n, dz);
+}
+
+extern "C" __global__ void kernelDoublesToHalfs(double *dx, int n, half *dz) {
+    convertToHalfGeneric<double>(dx, n, dz);
+}
+
+template <typename T>
+__device__ void convertHalfsToGeneric(half *dx, int n, T *dz) {
+    int tid = threadIdx.x + blockIdx.x * gridDim.x;
+
+    for (Nd4jIndex i = tid; i < n; i += blockDim.x * gridDim.x ) {
+        dz[i] = (T) __half2float(dx[i]);
+    }
+}
+
+extern "C" __global__ void kernelHalfsToDoubles(half *dx, int n, double *dz) {
+    convertHalfsToGeneric<double>(dx, n, dz);
+}
+
+extern "C" __global__ void kernelHalfsToFloats(half *dx, int n, float *dz) {
+    convertHalfsToGeneric<float>(dx, n, dz);
+}
+
+
+template <typename T>
+__device__ void averagingKernelGeneric(T **dx, T *dz, int n, Nd4jIndex length, bool propagate) {
+
+    __shared__ T *shmem;
+
+    if (threadIdx.x == 0) {
+        extern __shared__ unsigned char sharedmem[];
+        shmem = (T *) sharedmem;
+    }
+    __syncthreads();
+
+
+    // each block cycles over it's own part of arrays
+    for (int r = blockDim.x * blockIdx.x; r < length; r += blockDim.x * gridDim.x) {
+        shmem[threadIdx.x] = 0.0f;
+
+        Nd4jIndex baseIdx = r;
+
+        // aggregation step, we roll over all arrays
+        for (int ar = 0; ar < n; ar++) {
+            T *cdata = (T *) dx[ar];
+            cdata += baseIdx;
+
+            if (baseIdx + threadIdx.x < length)
+                shmem[threadIdx.x] += cdata[threadIdx.x];
+        }
+
+        // div step & write out step
+        T *wdata = dz + baseIdx;
+
+        if (baseIdx + threadIdx.x < length) {
+            shmem[threadIdx.x] /= n;
+            wdata[threadIdx.x] = shmem[threadIdx.x];
+        }
+
+        if (propagate)
+            for (int ar = 0; ar < n; ar++) {
+                T *cdata = (T *) dx[ar];
+                cdata += baseIdx;
+
+                if (baseIdx + threadIdx.x < length)
+                    cdata[threadIdx.x] = shmem[threadIdx.x];
+            }
+    }
+}
+
+
+extern "C" __global__ void averagingKernelHalf(float16 **dx, float16 *dz, int n, Nd4jIndex length, bool propagate) {
+    averagingKernelGeneric<float16>(dx, dz, n, length, propagate);
+}
+
+extern "C" __global__ void averagingKernelFloat(float **dx, float *dz, int n, Nd4jIndex length, bool propagate) {
+    averagingKernelGeneric<float>(dx, dz, n, length, propagate);
+}
+
+extern "C" __global__ void averagingKernelDouble(double **dx, double *dz, int n, Nd4jIndex length, bool propagate) {
+    averagingKernelGeneric<double>(dx, dz, n, length, propagate);
+}
+
+
+
+template<typename T>
+__device__ void shuffleKernelGeneric(T **dX, int **xShapeInfo, T **dZ, int **zShapeInfo, int N, int *shuffleMap, int **tadOnlyShapeInfo, int **tadOffsets) {
+
+            // we assume that shuffle map for each X contains pair TAD Y
+
+            __shared__ int tadLength;
+            __shared__ int tadEWS;
+            __shared__ int tadRank;
+            __shared__ int numTads;
+            __shared__ int *tadShape;
+            __shared__ int *tadStride;
+            __shared__ int yStride;
+
+
+        for (int f = 0; f < N; f++) {
+            T *x = (T *) dX[f];
+            T *z = (T *) dZ[f];
+
+
+
+            __syncthreads();
+
+            if (threadIdx.x == 0) {
+                tadLength = shape::length(tadOnlyShapeInfo[f]);
+                tadEWS = shape::elementWiseStride(tadOnlyShapeInfo[f]);
+                tadRank = shape::rank(tadOnlyShapeInfo[f]);
+                numTads = shape::length(xShapeInfo[f]) / tadLength;
+
+                tadShape = shape::shapeOf(tadOnlyShapeInfo[f]);
+                tadStride = shape::stride(tadOnlyShapeInfo[f]);
+            }
+            __syncthreads();
+
+
+            // we roll over the pairs of TADs, thus limit is numTads / 2
+            for (Nd4jIndex r = blockIdx.x; r < numTads; r += blockDim.x) {
+                if (shuffleMap[r] < 0)
+                    continue;
+
+                int oldOffset = tadOffsets[f][r];
+                int newOffset = tadOffsets[f][shuffleMap[r]];
+
+
+
+                T *rX = x + oldOffset;
+                T *rY = x + newOffset;
+
+                T *zX = z + oldOffset;
+                T *zY = z + newOffset;
+
+                // so we're going to change TAD[oldOffset] with TAD[newOffset]
+                if (tadEWS == 1) {
+                    for (Nd4jIndex i = threadIdx.x; i < tadLength; i += blockDim.x) {
+                        T oldX = rX[i];
+
+                        rX[i] = rY[i];
+                        zY[i] = oldX;
+                    }
+
+                } else {
+                    // well have to iterate using ind2sub
+                        int xCoord[MAX_RANK];
+                        int yCoord[MAX_RANK];
+                        for (Nd4jIndex i = threadIdx.x; i < tadLength; i+= blockDim.x) {
+                            shape::ind2subC(tadRank,tadShape, i, xCoord);
+                            shape::ind2subC(tadRank,tadShape, i, yCoord);
+
+                            Nd4jIndex xOffset = shape::getOffset(oldOffset, tadShape, tadStride, xCoord, tadRank);
+                            Nd4jIndex yOffset = shape::getOffset(newOffset, tadShape, tadStride, yCoord, tadRank);
+
+                            T oldX = x[xOffset];
+                            z[xOffset] = x[yOffset];
+                            z[yOffset] = oldX;
+                        }
+                    }
+            }
+        }
+}
+
+extern "C" __global__ void shuffleKernelDouble(double **x, int **xShapeInfo, double **z, int **zShapeInfo, int N, int *shuffleMap, int **tadOnlyShapeInfo, int **tadOffsets) {
+    shuffleKernelGeneric<double>(x, xShapeInfo, z, zShapeInfo, N, shuffleMap, tadOnlyShapeInfo, tadOffsets);
+}
+
+extern "C" __global__ void shuffleKernelFloat(float **x, int **xShapeInfo, float **z, int **zShapeInfo, int N, int *shuffleMap, int **tadOnlyShapeInfo, int **tadOffsets) {
+    shuffleKernelGeneric<float>(x, xShapeInfo, z, zShapeInfo, N, shuffleMap, tadOnlyShapeInfo, tadOffsets);
+}
+
+extern "C" __global__ void shuffleKernelHalf(float16 **x, int **xShapeInfo, float16 **z, int **zShapeInfo, int N, int *shuffleMap, int **tadOnlyShapeInfo, int **tadOffsets) {
+    shuffleKernelGeneric<float16>(x, xShapeInfo, z, zShapeInfo, N, shuffleMap, tadOnlyShapeInfo, tadOffsets);
+}
+
+// transform strided
+DISPATCH_KERNEL_SIMPLE(transformStrided_, transformSimpleGeneric, float, INPUT(Nd4jIndex n, float *x, int xStride, float *extraParams, float *z, int zStride, int *allocationPointer, float *reductionPointer), PARAMS(n, x, xStride, extraParams, z, zStride, allocationPointer, reductionPointer), OPS_A(TRANSFORM_OPS))
+DISPATCH_KERNEL_SIMPLE(transformStrided_, transformSimpleGeneric, double, INPUT(Nd4jIndex n, double *x, int xStride, double *extraParams, double *z, int zStride, int *allocationPointer, double *reductionPointer), PARAMS(n, x, xStride, extraParams, z, zStride, allocationPointer, reductionPointer), OPS_A(TRANSFORM_OPS))
+DISPATCH_KERNEL_SIMPLE(transformStrided_, transformSimpleGeneric, float16, INPUT(Nd4jIndex n, float16 *x, int xStride, float16 *extraParams, float16 *z, int zStride, int *allocationPointer, float16 *reductionPointer), PARAMS(n, x, xStride, extraParams, z, zStride, allocationPointer, reductionPointer), OPS_A(TRANSFORM_OPS))
+
+// transform shaped
+DISPATCH_KERNEL_SIMPLE(transformShaped_, transformSimpleGeneric, float, INPUT(float *x, int *xShape, int xRank, float *extraParams, float *z, int *zShape, int zRank, int *allocationPointer, float *reductionPointer), PARAMS(x, xShape, xRank, extraParams, z, zShape, zRank, allocationPointer, reductionPointer), OPS_A(TRANSFORM_OPS))
+DISPATCH_KERNEL_SIMPLE(transformShaped_, transformSimpleGeneric, double, INPUT(double *x, int *xShape, int xRank, double *extraParams, double *z, int *zShape, int zRank, int *allocationPointer, double *reductionPointer), PARAMS(x, xShape, xRank, extraParams, z, zShape, zRank, allocationPointer, reductionPointer), OPS_A(TRANSFORM_OPS))
+DISPATCH_KERNEL_SIMPLE(transformShaped_, transformSimpleGeneric, float16, INPUT(float16 *x, int *xShape, int xRank, float16 *extraParams, float16 *z, int *zShape, int zRank, int *allocationPointer, float16 *reductionPointer), PARAMS(x, xShape, xRank, extraParams, z, zShape, zRank, allocationPointer, reductionPointer), OPS_A(TRANSFORM_OPS))
 
 #endif
 

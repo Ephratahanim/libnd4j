@@ -8,6 +8,7 @@
 # Stage 1: find the root directory
 
 set(MKLROOT_PATH $ENV{MKLROOT})
+SET(VEC_MATH " ")
 
 if (NOT MKLROOT_PATH)
     # try to find at /opt/intel/mkl
@@ -18,8 +19,8 @@ if (NOT MKLROOT_PATH)
 endif (NOT MKLROOT_PATH)
 
 
-# Stage 2: find include path and libraries
 
+# Stage 2: find include path and libraries
 if (MKLROOT_PATH)
     # root-path found
 
@@ -38,6 +39,14 @@ if (MKLROOT_PATH)
             set(EXPECT_MKL_LIBPATH "${MKLROOT_PATH}/lib/ia32")
         endif (CMAKE_SIZEOF_VOID_P MATCHES 8)
     endif (CMAKE_SYSTEM_NAME MATCHES "Linux")
+	
+	 if (CMAKE_SYSTEM_NAME MATCHES "Windows")
+        if (CMAKE_SIZEOF_VOID_P MATCHES 8)
+            set(EXPECT_MKL_LIBPATH "${MKLROOT_PATH}\\lib\\intel64")
+        else (CMAKE_SIZEOF_VOID_P MATCHES 8)
+            set(EXPECT_MKL_LIBPATH "${MKLROOT_PATH}\\lib\\ia32")
+        endif (CMAKE_SIZEOF_VOID_P MATCHES 8)
+    endif (CMAKE_SYSTEM_NAME MATCHES "Windows")
 
     # set include
 
@@ -53,7 +62,18 @@ if (MKLROOT_PATH)
 
     find_library(LIB_MKL_RT NAMES mkl_rt HINTS ${MKL_LIBRARY_DIR})
     find_library(LIB_PTHREAD NAMES pthread)
+    find_library(LIB_SVML NAMES svml HINTS ${MKL_LIBRARY_DIR} ${EXPECT_ICC_LIBPATH})
+    find_library(LIB_IMF NAMES imf HINTS ${MKL_LIBRARY_DIR} ${EXPECT_ICC_LIBPATH})
+    find_library(LIB_IRC NAMES irc HINTS ${MKL_LIBRARY_DIR} ${EXPECT_ICC_LIBPATH})
     #find_library(LIB_IMF NAMES imf HINTS ${MKL_LIBRARY_DIR} ${EXPECT_ICC_LIBPATH})
+
+#    if (LIB_SVML)
+#        if(LIB_IMF)
+#            if (LIB_IRC)
+#                SET(VEC_MATH " -lsvml -limf -lirc")
+#            endif(LIB_IRC)
+#        endif(LIB_IMF)
+#    endif(LIB_SVML)
 
 endif (MKLROOT_PATH)
 

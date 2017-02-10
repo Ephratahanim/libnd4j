@@ -13,6 +13,7 @@
 #include <summarystatsreduce.h>
 #include <transform.h>
 #include <scalar.h>
+#include <aggregates.h>
 #include <pointercast.h>
 /**
  * Native op executioner:
@@ -76,8 +77,8 @@ public:
                        T *y,
                        int *yShapeInfo,
                        T *result,
-                       int *dimension, int dimensionLength, int *tadOnlyShapeInfo, int *tadOffsets) {
-		functions::broadcast::Broadcast<T>::exec(opNum, x, xShapeInfo, y, yShapeInfo, result, dimension, dimensionLength, tadOnlyShapeInfo, tadOffsets);
+                       int *dimension, int dimensionLength, int *tadOnlyShapeInfo, int *tadOffsets, int *tadOnlyShapeInfoZ, int *tadOffsetsZ) {
+		functions::broadcast::Broadcast<T>::exec(opNum, x, xShapeInfo, y, yShapeInfo, result, dimension, dimensionLength, tadOnlyShapeInfo, tadOffsets, tadOnlyShapeInfoZ, tadOffsetsZ);
     }
 
 
@@ -367,6 +368,34 @@ public:
 			resultIndexes);
     }
 
+	static void execScalar(int opNum,
+						   T *x,
+						   int *xShapeInfo,
+						   T *extraParams,
+						   T *z,
+						   int *zShapeInfo,
+						   T *scalars,
+						   int *dimension,
+						   int dimensionLength,
+						   int *tadShapeInfo,
+						   int *tadOffsets,
+						   int *tadShapeInfoZ,
+						   int *tadOffsetsZ) {
+		functions::scalar::ScalarTransform<T>::transform(opNum,
+														 x,
+														 xShapeInfo,
+														 extraParams,
+														 z,
+														 zShapeInfo,
+														 scalars,
+														 dimension,
+														 dimensionLength,
+														 tadShapeInfo,
+														 tadOffsets,
+														 tadShapeInfoZ,
+														 tadOffsetsZ);
+	}
+
     /**
      *
      * @param opNum
@@ -470,12 +499,12 @@ public:
                        int *xShapeInfo,
                        T *result,
                        int *resultShapeInfo,
-                       T *extraParams) {
+                       T *extraParams, int *tadShapeInfo, int *tadOffsets) {
 		functions::transform::Transform<T>::exec(opNum, dx,
                         xShapeInfo,
                         result,
                         resultShapeInfo,
-                        extraParams);
+                        extraParams, tadShapeInfo, tadOffsets);
     }
 
     /**
@@ -494,19 +523,22 @@ public:
                        T *result,
                        int *resultShapeInfo,
                        T *extraParams,
-                       Nd4jIndex *xIndexes,
-                       Nd4jIndex *resultIndexes) {
+                       int *xIndexes,
+                       int *resultIndexes, int *tadShapeInfo, int *tadOffsets) {
 		functions::transform::Transform<T>::exec(opNum, dx,
                         xShapeInfo,
                         result,
                         resultShapeInfo,
                         extraParams,
                         xIndexes,
-                        resultIndexes);
+                        resultIndexes, tadShapeInfo, tadOffsets);
 
     }
 
 
+	static void execAggregate(int opNum, T **arguments, int numArguments,  int **shapeArguments, int numShapeArguments, int *indexArguments, int numIndexArguments, int **intArrays, int numIntArrays, T *realArguments, int numRealArguments) {
+		functions::aggregate::AggregatedFunction<T>::exec(opNum, arguments, numArguments, shapeArguments, numShapeArguments, indexArguments, numIndexArguments, intArrays, numIntArrays, realArguments, numRealArguments);
+	}
 };
 
 

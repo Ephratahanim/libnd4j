@@ -5,7 +5,9 @@
 #ifndef NATIVEOPERATIONS_CONVOLUTION_H
 #define NATIVEOPERATIONS_CONVOLUTION_H
 
+#ifndef __CUDACC__
 #include <omp.h>
+#endif
 
 template <typename T>
 class Im2col {
@@ -58,7 +60,7 @@ int opSize() {
 
             T dIn = dbIn;
             T dOut = dbOut;
-#pragma omp parallel for simd collapse(4)
+#pragma omp parallel for simd collapse(4) default(shared)
             for (int ex = exampleFrom; ex < exampleTo; ex++) {
                 for (int d = depthFrom; d < depthTo; d++) {
                     inIndices[0] = ex;
@@ -208,7 +210,7 @@ private:
 
             T * fIn = dbCol;
             T * fOut = dbOut;
-#pragma omp parallel for
+#pragma omp parallel for default(shared)
             for (int ex = exampleFrom; ex < exampleTo; ex++) {
                 for (int d = depthFrom; d < depthTo; d++) {
                     inIndices[0] = ex;

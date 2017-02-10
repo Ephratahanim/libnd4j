@@ -1,9 +1,9 @@
 if(WIN32)
     # Which compilers to use for C and C++, and location of target
     # environment.
-    execute_process(COMMAND uname -m OUTPUT_VARIABLE ARCH)
+    execute_process(COMMAND uname -m OUTPUT_VARIABLE ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
     message("ARCH IS ${ARCH} and PROCESSOR ${CMAKE_SYSTEM_PROCESSOR}")
-    if( ${ARCH} EQUAL "x86_64")
+    if( ${ARCH} STREQUAL "x86_64")
         # First look in standard location as used by Debian/Ubuntu/etc.
         set(MINGW_ROOT /mingw64)
         message("64 bit!")
@@ -16,6 +16,7 @@ if(WIN32)
 
     SET(Open_BLAS_INCLUDE_SEARCH_PATHS
             ${MINGW_ROOT}/include
+            ${MINGW_ROOT}/include/OpenBLAS
             )
 
     SET(Open_BLAS_LIB_SEARCH_PATHS
@@ -31,6 +32,7 @@ else()
             /usr/local/include
             /usr/local/include/openblas
             /usr/local/include/openblas-base
+            /usr/local/opt/openblas/include
             /opt/OpenBLAS/include
             )
 
@@ -43,27 +45,42 @@ else()
             /usr/lib64
             /usr/local/lib
             /usr/local/lib64
+            /usr/local/opt/openblas/lib
             /opt/OpenBLAS/lib
             )
 
 endif()
 
-FIND_PATH(OpenBLAS_INCLUDE_DIR NAMES cblas.h PATHS ${Open_BLAS_INCLUDE_SEARCH_PATHS})
-FIND_LIBRARY(OpenBLAS_LIB NAMES openblas PATHS ${Open_BLAS_LIB_SEARCH_PATHS})
+FIND_PATH(OpenBLAS_INCLUDE_DIR NAMES cblas.h PATHS $ENV{OpenBLAS_HOME}/include ${Open_BLAS_INCLUDE_SEARCH_PATHS})
+FIND_LIBRARY(OpenBLAS_LIB NAMES openblas PATHS $ENV{OpenBLAS_HOME}/lib ${Open_BLAS_LIB_SEARCH_PATHS})
+
+
+# for "native" we can also go for libmvec, if it's available in system
+if ("${ARCH}" STREQUAL "native")
+    SET(MVEC_INC " -lmvec")
+    FIND_LIBRARY(MVEC_LIB NAMES mvec PATHS ${Open_BLAS_LIB_SEARCH_PATHS})
+
+    if(NOT MVEC_LIB)
+        SET(MVEC_INC " -lm")
+        MESSAGE(STATUS "Could not find MVEC lib. Falling back to generic math.")
+    endif()
+endif()
 
 SET(OpenBLAS_FOUND ON)
 
 #    Check include files
-IF(NOT OpenBLAS_INCLUDE_DIR)
-    SET(OpenBLAS_FOUND OFF)
-    MESSAGE(STATUS "Could not find OpenBLAS include. Turning OpenBLAS_FOUND off")
-ENDIF()
+#IF(NOT OpenBLAS_INCLUDE_DIR)
+#    SET(OpenBLAS_FOUND OFF)
+#    MESSAGE(STATUS "Could not find OpenBLAS include. Turning OpenBLAS_FOUND off")
+#ENDIF()
 
 #    Check libraries
 IF(NOT OpenBLAS_LIB)
     SET(OpenBLAS_FOUND OFF)
     MESSAGE(STATUS "Could not find OpenBLAS lib. Turning OpenBLAS_FOUND off")
 ENDIF()
+
+
 
 IF (OpenBLAS_FOUND)
     IF (NOT OpenBLAS_FIND_QUIETLY)

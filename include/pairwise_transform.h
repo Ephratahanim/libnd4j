@@ -7,10 +7,9 @@
 
 #ifndef PAIRWISE_TRANSFORM_H_
 #define PAIRWISE_TRANSFORM_H_
-#ifdef __JNI__
-#include <jni.h>
-#endif
+#ifndef __CUDACC__
 #include <omp.h>
+#endif
 #include <templatemath.h>
 #include <helper_cuda.h>
 #include <shape.h>
@@ -23,6 +22,8 @@
 #ifdef __CUDACC__
 #include <cuda.h>
 #include <cuda_runtime.h>
+#define omp_get_thread_num() 0
+#define omp_get_max_threads() 1
 #endif
 
 #define PAIRWISE_TRANSFORM_OPS \
@@ -42,7 +43,12 @@
         (13,simdOps::Max),\
         (14,simdOps::Min),\
         (15,simdOps::NotEqualTo),\
-        (16,simdOps::Copy)
+        (16,simdOps::Copy),\
+        (17,simdOps::Axpy),\
+        (45,simdOps::CompareAndSet),\
+        (46,simdOps::CompareAndReplace)
+
+
 
 
 namespace functions {
@@ -158,7 +164,7 @@ template<typename OpType>
 		int tid = blockIdx.x * blockDim.x + threadIdx.x;
 		Nd4jIndex n = shape::length(xShapeBuffer);
 
-		for (int i = tid; i < n; i += gridDim.x * blockDim.x) {
+		for (Nd4jIndex i = tid; i < n; i += gridDim.x * blockDim.x) {
 			result[resultIndexes[i]] = OpType::op(dx[indexes[i]],y[yIndexes[i]], extraParams);
 		}
 	}
@@ -232,7 +238,7 @@ template<typename OpType>
 			int yCoord[MAX_RANK];
 
 			if (dx == result) {
-				for (int i = tid; i < n; i += gridDim.x * blockDim.x) {
+				for (Nd4jIndex i = tid; i < n; i += gridDim.x * blockDim.x) {
 					shape::ind2subC(xRank,shape::shapeOf(xShapeBuffer), i, xCoord);
 					shape::ind2subC(yRank,shape::shapeOf(yShapeBuffer), i, yCoord);
 
@@ -243,7 +249,7 @@ template<typename OpType>
 			} else {
     			int resultCoord[MAX_RANK];
 
-				for (int i = tid; i < n; i += gridDim.x * blockDim.x) {
+				for (Nd4jIndex i = tid; i < n; i += gridDim.x * blockDim.x) {
 					shape::ind2subC(xRank,shape::shapeOf(xShapeBuffer), i, xCoord);
 					shape::ind2subC(yRank,shape::shapeOf(yShapeBuffer), i, yCoord);
 					shape::ind2subC(resultRank,shape::shapeOf(resultShapeBuffer), i, resultCoord);
@@ -254,6 +260,7 @@ template<typename OpType>
 					result[resultOffset] = OpType::op(dx[xOffset], y[yOffset], extraParams);
 				}
 			}
+
 		}
 	}
 
@@ -287,11 +294,11 @@ template<typename OpType>
 		int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
 		if (incx == incy && incy == incz && incx == 1) {
-			for (int i = tid; i < n; i += gridDim.x * blockDim.x) {
+			for (Nd4jIndex i = tid; i < n; i += gridDim.x * blockDim.x) {
 				result[i] = OpType::op(dx[i], dy[i], params);
 			}
 		} else {
-			for (int i = tid; i < n; i += gridDim.x * blockDim.x) {
+			for (Nd4jIndex i = tid; i < n; i += gridDim.x * blockDim.x) {
 				result[i * incz] = OpType::op(dx[i * incx], dy[i * incy], params);
 			}
 		}
@@ -353,7 +360,7 @@ template<typename OpType>
                     int *resultIndexes) {
                 Nd4jIndex n = shape::length(xShapeBuffer);
 
-#pragma omp parallel for simd schedule(guided)
+#pragma omp parallel for simd schedule(guided) proc_bind(AFFINITY) default(shared)
                 for (Nd4jIndex i = 0; i < n; i++) {
                     result[resultIndexes[i]] = OpType::op(dx[indexes[i]], y[yIndexes[i]], extraParams);
 
@@ -418,60 +425,79 @@ template<typename OpType>
                     int *yStride = shape::stride(yShapeBuffer);
                     int *resultStride = shape::stride(resultShapeBuffer);
 
+                    // tad-oriented rotation technically
+
+                    int tadsPerThread = xShape[0] / TAD_THRESHOLD;
+                    int num_threads = nd4j::math::nd4j_max<int>(1, tadsPerThread);
+                    num_threads = nd4j::math::nd4j_min<int>(num_threads, omp_get_max_threads());
+
+#pragma omp parallel for schedule(guided) num_threads(num_threads) if (num_threads>1) proc_bind(AFFINITY) default(shared)
+for (Nd4jIndex i = 0; i < xShape[0]; i++) {
+                    T *dxLocal = dx + xStride[0] * i;
+                    T *yLocal = y + yStride[0] * i;
+                    T *resultLocal = result + resultStride[0] * i;
+
+                    int rankLocal = rank - 1;
+                    int *xShapeLocal = xShape + 1;
+
+                    int *xStrideLocal = xStride + 1;
+                    int *yStrideLocal = yStride + 1;
+                    int *resultStrideLocal = resultStride + 1;
+
                     int shapeIter[MAX_RANK];
                     int coord[MAX_RANK];
                     int dim;
                     int xStridesIter[MAX_RANK];
                     int yStridesIter[MAX_RANK];
                     int resultStridesIter[MAX_RANK];
-                    if (PrepareThreeRawArrayIter<T>(rank,
-                                                    xShape,
-                                                    dx,
-                                                    xStride,
-                                                    y,
-                                                    yStride,
-                                                    result,
-                                                    resultStride,
-                                                    rank,
+                    if (PrepareThreeRawArrayIter<T>(rankLocal,
+                                                    xShapeLocal,
+                                                    dxLocal,
+                                                    xStrideLocal,
+                                                    yLocal,
+                                                    yStrideLocal,
+                                                    resultLocal,
+                                                    resultStrideLocal,
+                                                    rankLocal,
                                                     shapeIter,
-                                                    &dx,
+                                                    &dxLocal,
                                                     xStridesIter,
-                                                    &y,
+                                                    &yLocal,
                                                     yStridesIter,
-                                                    &result,
+                                                    &resultLocal,
                                                     resultStridesIter) >= 0) {
-                        ND4J_RAW_ITER_START(dim, rank, coord, shapeIter); {
+                        ND4J_RAW_ITER_START(dim, rankLocal, coord, shapeIter); {
                                 /* Process the innermost dimension */
-                                T *xIter = dx;
-                                T *yIter = y;
-                                T *resultIter = result;
+                                T *xIter = dxLocal;
+                                T *yIter = yLocal;
+                                T *resultIter = resultLocal;
                                 resultIter[0] = OpType::op(xIter[0], yIter[0], extraParams);
                             }
                         ND4J_RAW_ITER_THREE_NEXT(dim,
-                                                 rank,
+                                                 rankLocal,
                                                  coord,
                                                  shapeIter,
-                                                 dx,
+                                                 dxLocal,
                                                  xStridesIter,
-                                                 y,
+                                                 yLocal,
                                                  yStridesIter,
-                                                 result,
+                                                 resultLocal,
                                                  resultStridesIter);
                     }
                     else {
                         printf("Unable to prepare array\n");
                     }
+}
 
                 }
 
                 else {
+
+
                     Nd4jIndex len = shape::length(xShapeBuffer);
                     int xRank = shape::rank(xShapeBuffer);
                     int yRank = shape::rank(yShapeBuffer);
                     int resultRank = shape::rank(resultShapeBuffer);
-                    int *xCoord = new int[xRank];
-                    int *yCoord = new int[yRank];
-                    int *resultCoord = new int[resultRank];
 
                     int *xShape = shape::shapeOf(xShapeBuffer);
                     int *xStride = shape::stride(xShapeBuffer);
@@ -480,11 +506,19 @@ template<typename OpType>
                     int *yStride = shape::stride(yShapeBuffer);
 
                     int *resultShape = shape::shapeOf(resultShapeBuffer);
+
+                    int elementsPerThread = n / ELEMENT_THRESHOLD;
+                    int num_threads = nd4j::math::nd4j_max<int>(1, elementsPerThread);
+                    num_threads = nd4j::math::nd4j_min<int>(num_threads, omp_get_max_threads());
+
                     if(dx == result) {
+#pragma omp parallel for schedule(guided) num_threads(num_threads) if (num_threads > 1) proc_bind(AFFINITY) default(shared)
                         for (Nd4jIndex i = 0; i < len; i++) {
+                            int xCoord[MAX_RANK];
+                            int yCoord[MAX_RANK];
+
                             shape::ind2subC(xRank,xShape, i, xCoord);
                             shape::ind2subC(yRank,yShape, i, yCoord);
-                            shape::ind2subC(resultRank,resultShape, i, resultCoord);
 
                             Nd4jIndex xOffset = shape::getOffset(0, xShape, xStride, xCoord, xRank);
                             Nd4jIndex yOffset = shape::getOffset(0, yShape, yStride, yCoord, yRank);
@@ -493,7 +527,12 @@ template<typename OpType>
                         }
                     }
                     else {
+#pragma omp parallel for schedule(guided) num_threads(num_threads) if (num_threads > 1) proc_bind(AFFINITY) default(shared)
                         for (Nd4jIndex i = 0; i < len; i++) {
+                            int xCoord[MAX_RANK];
+                            int yCoord[MAX_RANK];
+                            int resultCoord[MAX_RANK];
+
                             shape::ind2subC(xRank,xShape, i, xCoord);
                             shape::ind2subC(yRank,yShape, i, yCoord);
                             shape::ind2subC(resultRank,resultShape, i, resultCoord);
@@ -505,53 +544,53 @@ template<typename OpType>
 
                         }
                     }
-
-
-                    delete[] xCoord;
-                    delete[] yCoord;
-                    delete []resultCoord;
                 }
             }
 
-			template<typename OpType>
-			static void exec(T *dx,
-                              Nd4jIndex xStride,
-                              T *y,
-                              Nd4jIndex yStride,
-                              T *result,
-                              Nd4jIndex resultStride,
-                              T *extraParams,
-                              Nd4jIndex n) {
+            template<typename OpType>
+            static void exec(T *dx,
+                             Nd4jIndex xStride,
+                             T *y,
+                             Nd4jIndex yStride,
+                             T *result,
+                             Nd4jIndex resultStride,
+                             T *extraParams,
+                             const Nd4jIndex n) {
+                int elementsPerThread = n / ELEMENT_THRESHOLD;
+                int _threads = nd4j::math::nd4j_max<int>(1, elementsPerThread);
+                _threads = nd4j::math::nd4j_min<int>(_threads, omp_get_max_threads());
+
+                int span = (n / _threads) + 8;
+
                 if (xStride == 1 && yStride == 1 && resultStride == 1) {
-					if (n > 2048000) {
-#pragma omp parallel for simd schedule(guided)
-						for (Nd4jIndex i = 0; i < n; i++) {
-							result[i] = OpType::op(dx[i], y[i], extraParams);
-						}
-					} else {
+#pragma omp parallel num_threads(_threads) if (_threads>1) proc_bind(AFFINITY) default(shared)
+                    {
+                        int tid = omp_get_thread_num();
+                        int start = span * tid;
+                        int end = span * (tid + 1);
+                        if (end > n) end = n;
 #pragma omp simd
-						for (Nd4jIndex i = 0; i < n; i++) {
-							result[i] = OpType::op(dx[i], y[i], extraParams);
-						}
-					}
+                        for (Nd4jIndex i = start; i < end; i++) {
+                            result[i] = OpType::op(dx[i], y[i], extraParams);
+                        }
+                    }
                 }
                 else {
-					if (n > 2048000) {
-#pragma omp parallel for simd schedule(guided) if (n > 2048)
-						for (Nd4jIndex i = 0; i < n; i++) {
-							result[i * resultStride] = OpType::op(dx[i * xStride],
-																  y[i * yStride], extraParams);
-						}
-					} else {
+#pragma omp parallel num_threads(_threads) if (_threads>1) proc_bind(AFFINITY) default(shared)
+                    {
+                        int tid = omp_get_thread_num();
+                        int start = span * tid;
+                        int end = span * (tid + 1);
+                        if (end > n) end = n;
+
 #pragma omp simd
-						for (Nd4jIndex i = 0; i < n; i++) {
-							result[i * resultStride] = OpType::op(dx[i * xStride],
-																  y[i * yStride], extraParams);
-						}
-					}
+                        for (Nd4jIndex i = start; i < end; i++) {
+                            result[i * resultStride] = OpType::op(dx[i * xStride], y[i * yStride], extraParams);
+                        }
+                    }
                 }
             }
-		};
+        };
     }
 }
 
@@ -683,7 +722,26 @@ extern "C" __global__ void pairWiseTransformFloat(
 
 }
 
+extern "C" __global__ void pairWiseTransformHalf(
+		int opNum,
+		float16 *dx,
+		float16 *dy,
+		float16 *params,
+		float16 *result,
+		int *xShapeInfo, int xRank,
+		int *yShapeInfo, int yRank,
+		int *resultShapeInfo, int zRank, int *allocationPointer, int *tadOnlyShapeInfo) {
+	pairWiseTransformGeneric<float16>(
+			opNum,
+			dx,
+			dy,
+			params,
+			result,
+			xShapeInfo, xRank,
+			yShapeInfo, yRank,
+			resultShapeInfo, zRank, allocationPointer, tadOnlyShapeInfo);
 
+}
 
 /**
  * The api for the driver interface
@@ -759,7 +817,7 @@ __device__ void pairWiseTransformGeneric(
  * @param incz the result stride
  * @param blockSize the block size
  */
-__global__ void pairWiseTransformDoubleIndex(
+extern "C" __global__ void pairWiseTransformDoubleIndex(
 		int opNum,
 		double *dx,
 		double *dy,
@@ -804,7 +862,7 @@ __global__ void pairWiseTransformDoubleIndex(
  * @param incz the result stride
  * @param blockSize the block size
  */
-__global__ void pairWiseTransformFloatIndex(
+extern "C" __global__ void pairWiseTransformFloatIndex(
 		int opNum,
 		float *dx,
 		float *dy,
@@ -817,6 +875,32 @@ __global__ void pairWiseTransformFloatIndex(
 		int *yIndexes,
 		int *resultIndexes, int *allocationPointer, int *tadOnlyShapeInfo) {
 	pairWiseTransformGeneric<float>(
+			opNum,
+			dx,
+			dy,
+			params,
+			result,
+			xShapeInfo, xRank,
+			yShapeInfo, yRank,
+			resultShapeInfo, zRank,
+			xIndexes,
+			yIndexes,
+			resultIndexes, allocationPointer, tadOnlyShapeInfo);
+}
+
+extern "C" __global__ void pairWiseTransformHalfIndex(
+		int opNum,
+		float16 *dx,
+		float16 *dy,
+		float16 *params,
+		float16 *result,
+		int *xShapeInfo, int xRank,
+		int *yShapeInfo, int yRank,
+		int *resultShapeInfo, int zRank,
+		int *xIndexes,
+		int *yIndexes,
+		int *resultIndexes, int *allocationPointer, int *tadOnlyShapeInfo) {
+	pairWiseTransformGeneric<float16>(
 			opNum,
 			dx,
 			dy,
@@ -901,7 +985,7 @@ __device__ void pairWiseTransformStridedGeneric(
  * @param incz the result stride
  * @param blockSize the block size
  */
-__global__ void pairWiseTransformStridedDouble(
+extern "C" __global__ void pairWiseTransformStridedDouble(
 		int opNum,
 		Nd4jIndex n,
 		double *dx,
@@ -938,7 +1022,7 @@ __global__ void pairWiseTransformStridedDouble(
  * @param incz the result stride
  * @param blockSize the block size
  */
-__global__ void pairWiseTransformStridedFloat(
+extern "C" __global__ void pairWiseTransformStridedFloat(
 		int opNum,
 		Nd4jIndex n,
 		float *dx,
@@ -960,6 +1044,28 @@ __global__ void pairWiseTransformStridedFloat(
 			incz, allocationPointer, tadOnlyShapeInfo);
 }
 
+
+extern "C" __global__ void pairWiseTransformStridedHalf(
+		int opNum,
+		Nd4jIndex n,
+		float16 *dx,
+		float16 *dy,
+		int incx,
+		int incy,
+		float16 *params,
+		float16 *result,
+		int incz, int *allocationPointer, int *tadOnlyShapeInfo) {
+	pairWiseTransformStridedGeneric<float16>(
+			opNum,
+			n,
+			dx,
+			dy,
+			incx,
+			incy,
+			params,
+			result,
+			incz, allocationPointer, tadOnlyShapeInfo);
+}
 
 
 #endif

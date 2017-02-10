@@ -8,7 +8,9 @@
 #ifndef INDEXREDUCE_H_
 #define INDEXREDUCE_H_
 #include <shape.h>
+#ifndef __CUDACC__
 #include <omp.h>
+#endif
 #include <dll.h>
 #include <ops.h>
 #include <op_boilerplate.h>
@@ -17,12 +19,11 @@
 #include <helper_cuda.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#define omp_get_thread_num() 0
+#define omp_get_max_threads() 1
 #endif
 
 
-#ifdef __JNI__
-#include <jni.h>
-#endif
 #include <pairwise_util.h>
 
 
@@ -255,7 +256,7 @@ template<typename OpType>
 
 					__syncthreads();
 					if (threadIdx.x == 0) {
-						result[r] = sPartials[threadIdx.x].index;
+						result[r] = (T) sPartials[threadIdx.x].index;
 					}
 				}
 			} else {
@@ -276,7 +277,7 @@ template<typename OpType>
 
 					__syncthreads();
 					if (threadIdx.x == 0) {
-						result[i] = sPartials[threadIdx.x].index; //postProcess(sPartials[0],tadLength ,extraParams);
+						result[i] = (T)  sPartials[threadIdx.x].index; //postProcess(sPartials[0],tadLength ,extraParams);
 					}
 				}
 			}
@@ -289,7 +290,7 @@ template<typename OpType>
 			int xElementWiseStride = shape::elementWiseStride(xShapeInfo);
 
 			if(xElementWiseStride >= 1) {
-				for(unsigned int i = tid;i < n; i += (blockDim.x * gridDim.x)) {
+				for(int i = tid;i < n; i += (blockDim.x * gridDim.x)) {
 					IndexValue <T> indexVal = {dx[i * xElementWiseStride], i};
 					reduction = OpType::update(reduction, indexVal, extraParams);
 				}
@@ -297,7 +298,7 @@ template<typename OpType>
 				int rank = shape::rank(xShapeInfo);
 				int ind2sub[MAX_RANK];
 #pragma unroll
-				for(unsigned int i = tid;i < n; i += blockDim.x * gridDim.x) {
+				for(int i = tid;i < n; i += blockDim.x * gridDim.x) {
 					shape::ind2sub(rank,shape::shapeOf(xShapeInfo),i,ind2sub);
 					int offset = shape::getOffset(0,shape::shapeOf(xShapeInfo),shape::stride(xShapeInfo),ind2sub,rank);
 					IndexValue <T> indexVal = {dx[offset], i};
@@ -325,20 +326,20 @@ template<typename OpType>
 				__syncthreads();
 
 				if (tid==0) {
-					unsigned int ticket = atomicInc(&tc[4096], gridDim.x);
+					unsigned int ticket = atomicInc(&tc[16384], gridDim.x);
 				    amLast = (ticket == gridDim.x-1);
 				}
 
 				__syncthreads();
 
 				if (amLast) {
-					tc[4096] = 0;
+					tc[16384] = 0;
 					IndexValue<T> *pBuffer = (IndexValue<T> *) reductionBuffer;
 
 
 					sPartials[threadIdx.x] = {0, 0};
 
-					for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
+					for (Nd4jIndex i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
                         sPartials[threadIdx.x] = OpType::update(sPartials[threadIdx.x], pBuffer[i], extraParams);
                     }
 
@@ -349,14 +350,14 @@ template<typename OpType>
 
 					__syncthreads();
 					if (tid == 0) {
-						result[0] = sPartials[0].index;
+						result[0] = (T)  sPartials[0].index;
 					}
 				}
 			} else {
 				if (tid == 0) {
 					unsigned int *tc = (unsigned *) reductionBuffer;
-					tc[4096] = 0;
-					result[0] = sPartials[0].index;
+					tc[16384] = 0;
+					result[0] = (T) sPartials[0].index;
 				}
 			}
 		}
@@ -442,9 +443,10 @@ template<typename OpType>
 				else {
 
 					if (xElementWiseStride == 1) {
-						if(length < 8000) {
-#pragma omp simd
-							for (int i = 0; i < length; i++) {
+						if(length < ELEMENT_THRESHOLD) {
+// FIXME: proper reduction to be used here
+//#pragma omp simd
+							for (Nd4jIndex i = 0; i < length; i++) {
 								IndexValue<T> curr;
 								curr.value = x[i];
 								curr.index = i;
@@ -457,16 +459,16 @@ template<typename OpType>
 							return startingIndex.index;
 						}
 						else {
-							BlockInformation info(length);
+							BlockInformation info(length, ELEMENT_THRESHOLD);
 
-#pragma omp parallel
+#pragma omp parallel num_threads(info.threads) if (info.threads > 1) default(shared)
 
 							{
 								IndexValue<T> local;
 								local.value = OpType::startingValue(x);
 								local.index = 0;
 
-								for (int i = omp_get_thread_num(); i < info.chunks; i+= info.threads) {
+								for (Nd4jIndex i = omp_get_thread_num(); i < info.chunks; i+= info.threads) {
 									int newOffset = (i * info.items);
 									T *chunk = x + newOffset;
 									int itemsToLoop = info.items;
@@ -479,7 +481,7 @@ template<typename OpType>
 										itemsToLoop = length - newOffset;
 									}
 
-									for (int j = 0; j < itemsToLoop; j++) {
+									for (Nd4jIndex j = 0; j < itemsToLoop; j++) {
 										IndexValue<T> curr;
 										curr.value = chunk[j];
 										curr.index = j;
@@ -503,24 +505,17 @@ template<typename OpType>
 					}
 
 					else {
-						for (int i = 0; i < length; i++) {
+						for (Nd4jIndex i = 0; i < length; i++) {
 							IndexValue<T> curr;
 							curr.value = x[i * xElementWiseStride];
 							curr.index = i;
 							startingIndex = OpType::update(startingIndex, curr,
 												   extraParams);
-
 						}
-
-
-
 					}
-
-
 				}
 
 				return  startingIndex.index;
-
 			}
 
 			
@@ -547,8 +542,8 @@ template<typename OpType>
 				const int resultLength = shape::length(resultShapeInfoBuffer);
 				IndexValue<T> *startingIndex = new IndexValue<T>[resultLength];
 
-#pragma omp parallel for schedule(guided) if (resultLength > 32)
-				for (int i = 0; i < resultLength; i++) {
+#pragma omp parallel for schedule(guided) if (resultLength > TAD_THRESHOLD) default(shared)
+				for (Nd4jIndex i = 0; i < resultLength; i++) {
 					IndexValue<T> val;
 					val.value = OpType::startingValue(x);
 					val.index = 0;
@@ -566,6 +561,7 @@ template<typename OpType>
 
 					if (tad->dimensionLength < 1) {
 						delete tad;
+						delete[] startingIndex;
 						return;
 					}
 
@@ -593,8 +589,8 @@ template<typename OpType>
 					int *xStride = shape::stride(tadShapeShapeInfo);
 					int rank = shape::rank(tadShapeShapeInfo);
 
-#pragma omp  parallel for schedule(guided) if (resultLength > 32)
-					for(int i = 0; i < resultLength; i++) {
+#pragma omp  parallel for schedule(guided) if (resultLength > TAD_THRESHOLD) default(shared)
+					for(Nd4jIndex i = 0; i < resultLength; i++) {
 						int offset = tadOffsets[i];
 						int shapeIter[MAX_RANK];
 						int coord[MAX_RANK];
@@ -636,14 +632,14 @@ template<typename OpType>
 					int tadElementWiseStride = shape::elementWiseStride(tadOnlyShapeInfo);
 					const int tadLength = shape::length(tadOnlyShapeInfo);
 
-#pragma omp parallel for schedule(guided) if (resultLength > 32)
-					for(int i = 0;  i < resultLength; i++) {
+#pragma omp parallel for schedule(guided) if (resultLength > TAD_THRESHOLD) default(shared)
+					for(Nd4jIndex i = 0;  i < resultLength; i++) {
 						int baseOffset = tadOffsets[i];
 						IndexValue<T> indexValue;
 						indexValue.index = 0;
 						indexValue.value = x[baseOffset];
 
-#pragma omp simd
+// FIXME: proper reduction required here
 						for(int j = 1; j < tadLength; j++) {
 							IndexValue<T> comp;
 							comp.index = j;
@@ -782,6 +778,29 @@ __global__ void indexReduceFloat(
 		int dimensionLength,
 		int postProcessOrNot,  int *allocationBuffer, float *reductionBuffer, int *tadOnlyShapeInfo, int *tadOffsets) {
 	indexReduceGeneric<float>(
+			op,
+			dx,
+			xShapeInfo, xRank,
+			extraParams,
+			result,
+			resultShapeInfo, zRank,
+			dimension,
+			dimensionLength,
+			postProcessOrNot, allocationBuffer, reductionBuffer, tadOnlyShapeInfo, tadOffsets);
+
+}
+
+__global__ void indexReduceHalf(
+		int op,
+		float16 *dx,
+		int *xShapeInfo, int xRank,
+		float16 *extraParams,
+		float16 *result,
+		int *resultShapeInfo, int zRank,
+		int *dimension,
+		int dimensionLength,
+		int postProcessOrNot,  int *allocationBuffer, float16 *reductionBuffer, int *tadOnlyShapeInfo, int *tadOffsets) {
+	indexReduceGeneric<float16>(
 			op,
 			dx,
 			xShapeInfo, xRank,
